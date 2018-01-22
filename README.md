@@ -1,10 +1,14 @@
 # inotify-rs [![crates.io](https://img.shields.io/crates/v/inotify.svg)](https://crates.io/crates/inotify) [![Documentation](https://docs.rs/inotify/badge.svg)](https://docs.rs/inotify) [![Build Status](https://travis-ci.org/inotify-rs/inotify.svg?branch=master)](https://travis-ci.org/hannobraun/inotify-rs)
 
 Idiomatic [inotify] wrapper for the [Rust programming language].
+
 Using async io when used in coroutine context (no blocking worker threads).
-It's the same as the original project when use in thread context.
+
+When used in thread context, it's the same as the original project usage.
 
 ```Rust
+#[macro_use]
+extern crate may;
 extern crate inotify;
 
 
@@ -17,7 +21,7 @@ use inotify::{
 };
 
 
-fn main() {
+fn run_in_coroutine() {
     let mut inotify = Inotify::init()
         .expect("Failed to initialize inotify");
 
@@ -62,6 +66,10 @@ fn main() {
         }
     }
 }
+
+fn main() {
+    go!(run_in_coroutine).join().unwrap();
+}
 ```
 
 
@@ -71,7 +79,7 @@ Inlude it in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-inotify = "0.4"
+inotify = { git = "https://github.com/rust-may/inotify.git" }
 ```
 
 Please refer to the [documentation] and the example above, for information on how to use it in your code.
