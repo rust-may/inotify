@@ -4,6 +4,8 @@
 // This test suite is incomplete and doesn't cover all available functionality.
 // Contributions to improve test coverage would be highly appreciated!
 
+#[macro_use]
+extern crate may;
 extern crate inotify;
 extern crate tempdir;
 
@@ -30,28 +32,32 @@ fn it_should_watch_a_file() {
     let mut testdir = TestDir::new();
     let (path, mut file) = testdir.new_file();
 
-    let mut inotify = Inotify::init().unwrap();
-    let watch = inotify.add_watch(&path, WatchMask::MODIFY).unwrap();
-
-    write_to(&mut file);
-
     let mut buffer = [0; 1024];
-    let events = inotify.read_events_blocking(&mut buffer).unwrap();
 
-    let mut num_events = 0;
-    for event in events {
-        assert_eq!(watch, event.wd);
-        num_events += 1;
-    }
-    assert!(num_events > 0);
+    join!({
+        let mut inotify = Inotify::init().unwrap();
+        let watch = inotify.add_watch(&path, WatchMask::MODIFY).unwrap();
+
+        write_to(&mut file);
+
+        let events = inotify.read_events_blocking(&mut buffer).unwrap();
+
+        let mut num_events = 0;
+        for event in events {
+            assert_eq!(watch, event.wd);
+            num_events += 1;
+        }
+        assert!(num_events > 0);
+    });
 }
 
 #[test]
 fn it_should_return_immediately_if_no_events_are_available() {
-    let mut inotify = Inotify::init().unwrap();
-
     let mut buffer = [0; 1024];
-    assert_eq!(0, inotify.read_events(&mut buffer).unwrap().count());
+    join!({
+        let mut inotify = Inotify::init().unwrap();
+        assert_eq!(0, inotify.read_events(&mut buffer).unwrap().count())
+    });
 }
 
 #[test]

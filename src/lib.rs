@@ -76,7 +76,7 @@ extern crate bitflags;
 
 extern crate libc;
 extern crate inotify_sys as ffi;
-
+extern crate may;
 
 use std::mem;
 use std::hash::{
@@ -104,15 +104,81 @@ use std::ffi::{
 };
 
 use libc::{
-    F_GETFL,
-    F_SETFL,
-    O_NONBLOCK,
-    fcntl,
     c_void,
     size_t,
     c_int,
 };
 
+use may::io::CoIo;
+
+#[derive(Debug, PartialEq)]
+struct InotifyFd {
+    fd: RawFd,
+}
+
+impl AsRawFd for InotifyFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl io::Read for InotifyFd {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // just impl read for InotifyFd to for use CoIo read interface
+        let num_bytes = unsafe {
+            ffi::read(
+                self.fd,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as size_t
+            )
+        };
+
+        let num_bytes = match num_bytes {
+            0 => {
+                return Err(
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "`read` return `0`, signaling end-of-file"
+                    )
+                );
+            }
+            -1 => {
+                let error = io::Error::last_os_error();
+                return Err(error);
+            },
+            _ if num_bytes < 0 => {
+                panic!("{} {} {} {} {} {}",
+                    "Unexpected return value from `read`. Received a negative",
+                    "value that was not `-1`. According to the `read` man page",
+                    "this shouldn't happen, as either `-1` is returned on",
+                    "error, `0` on end-of-file, or a positive value for the",
+                    "number of bytes read. Returned value:",
+                    num_bytes,
+                );
+            }
+            _ => {
+                // The value returned by `read` should be `isize`. Let's quickly
+                // verify this with the following assignment, so we can be sure
+                // our cast below is valid.
+                let num_bytes: isize = num_bytes;
+
+                // The type returned by `read` is `isize`, and we've ruled out
+                // all negative values with the match arms above. This means we
+                // can safely cast to `usize`.
+                debug_assert!(num_bytes > 0);
+                num_bytes as usize
+            }
+        };
+        Ok(num_bytes)
+    }
+}
+
+impl<'a> io::Read for &'a InotifyFd {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let s = unsafe { &mut *(*self as *const _ as *mut _) };
+        InotifyFd::read(s, buf)
+    }
+}
 
 /// Idiomatic Rust wrapper around Linux's inotify API
 ///
@@ -125,7 +191,7 @@ use libc::{
 ///
 /// [top-level documentation]: index.html
 pub struct Inotify {
-    fd           : Rc<RawFd>,
+    fd           : Rc<CoIo<InotifyFd>>,
     close_on_drop: bool,
 }
 
@@ -182,11 +248,13 @@ impl Inotify {
 
         match fd {
             -1 => Err(io::Error::last_os_error()),
-            _  =>
+            _  => {
+                let coio = CoIo::new(InotifyFd{ fd }).expect("failed to create Coio for inotify");
                 Ok(Inotify {
-                    fd           : Rc::new(fd),
+                    fd           : Rc::new(coio),
                     close_on_drop: true,
-                }),
+                })
+            }
         }
     }
 
@@ -263,7 +331,7 @@ impl Inotify {
 
         let wd = unsafe {
             ffi::inotify_add_watch(
-                *self.fd,
+                self.fd.as_raw_fd(),
                 path.as_ptr() as *const _,
                 mask.bits(),
             )
@@ -327,14 +395,14 @@ impl Inotify {
     /// [`io::Error`]: https://doc.rust-lang.org/std/io/struct.Error.html
     /// [`ErrorKind`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html
     pub fn rm_watch(&mut self, wd: WatchDescriptor) -> io::Result<()> {
-        if wd.fd.upgrade().as_ref() != Some(&self.fd) {
+        if wd.fd.upgrade().as_ref().map(|coio| coio.as_raw_fd()) != Some(self.fd.as_raw_fd()) {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 "Invalid WatchDescriptor",
             ));
         }
 
-        let result = unsafe { ffi::inotify_rm_watch(*self.fd, wd.id) };
+        let result = unsafe { ffi::inotify_rm_watch(self.fd.as_raw_fd(), wd.id) };
         match result {
             0  => Ok(()),
             -1 => Err(io::Error::last_os_error()),
@@ -360,15 +428,12 @@ impl Inotify {
     pub fn read_events_blocking<'a>(&mut self, buffer: &'a mut [u8])
         -> io::Result<Events<'a>>
     {
-        unsafe {
-            fcntl(*self.fd, F_SETFL, fcntl(*self.fd, F_GETFL) & !O_NONBLOCK)
-        };
-        let result = self.read_events(buffer);
-        unsafe {
-            fcntl(*self.fd, F_SETFL, fcntl(*self.fd, F_GETFL) | O_NONBLOCK)
-        };
-
-        result
+        use std::io::Read;
+        // use coroutine block version read
+        match (&*self.fd).read(buffer) {
+            Ok(num_bytes) => Ok(Events::new(Rc::downgrade(&self.fd), buffer, num_bytes)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Returns any available events
@@ -418,57 +483,15 @@ impl Inotify {
     pub fn read_events<'a>(&mut self, buffer: &'a mut [u8])
         -> io::Result<Events<'a>>
     {
-        let num_bytes = unsafe {
-            ffi::read(
-                *self.fd,
-                buffer.as_mut_ptr() as *mut c_void,
-                buffer.len() as size_t
-            )
-        };
-
-        let num_bytes = match num_bytes {
-            0 => {
-                return Err(
-                    io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "`read` return `0`, signaling end-of-file"
-                    )
-                );
+        use std::io::Read;
+        // this is the non blocking version read
+        match (&*self.fd).inner().read(buffer) {
+            Ok(num_bytes) => Ok(Events::new(Rc::downgrade(&self.fd), buffer, num_bytes)),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Ok(Events::new(Rc::downgrade(&self.fd), buffer, 0))
             }
-            -1 => {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(Events::new(Rc::downgrade(&self.fd), buffer, 0));
-                }
-                else {
-                    return Err(error);
-                }
-            },
-            _ if num_bytes < 0 => {
-                panic!("{} {} {} {} {} {}",
-                    "Unexpected return value from `read`. Received a negative",
-                    "value that was not `-1`. According to the `read` man page",
-                    "this shouldn't happen, as either `-1` is returned on",
-                    "error, `0` on end-of-file, or a positive value for the",
-                    "number of bytes read. Returned value:",
-                    num_bytes,
-                );
-            }
-            _ => {
-                // The value returned by `read` should be `isize`. Let's quickly
-                // verify this with the following assignment, so we can be sure
-                // our cast below is valid.
-                let num_bytes: isize = num_bytes;
-
-                // The type returned by `read` is `isize`, and we've ruled out
-                // all negative values with the match arms above. This means we
-                // can safely cast to `usize`.
-                debug_assert!(num_bytes > 0);
-                num_bytes as usize
-            }
-        };
-
-        Ok(Events::new(Rc::downgrade(&self.fd), buffer, num_bytes))
+            Err(e) => Err(e),
+        }
     }
 
     /// Closes the inotify instance
@@ -502,7 +525,7 @@ impl Inotify {
         // unless this flag here is cleared.
         self.close_on_drop = false;
 
-        match unsafe { ffi::close(*self.fd) } {
+        match unsafe { ffi::close(self.fd.as_raw_fd()) } {
             0 => Ok(()),
             _ => Err(io::Error::last_os_error()),
         }
@@ -512,21 +535,22 @@ impl Inotify {
 impl Drop for Inotify {
     fn drop(&mut self) {
         if self.close_on_drop {
-            unsafe { ffi::close(*self.fd); }
+            unsafe { ffi::close(self.fd.as_raw_fd()); }
         }
     }
 }
 
 impl AsRawFd for Inotify {
     fn as_raw_fd(&self) -> RawFd {
-        *self.fd
+        self.fd.as_raw_fd()
     }
 }
 
 impl FromRawFd for Inotify {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        let coio = CoIo::new(InotifyFd{ fd }).expect("failed to create coio from fd");
         Inotify {
-            fd           : Rc::new(fd),
+            fd           : Rc::new(coio),
             close_on_drop: true,
         }
     }
@@ -535,7 +559,7 @@ impl FromRawFd for Inotify {
 impl IntoRawFd for Inotify {
     fn into_raw_fd(mut self) -> RawFd {
         self.close_on_drop = false;
-        *self.fd
+        self.fd.as_raw_fd()
     }
 }
 
@@ -814,15 +838,15 @@ bitflags! {
 #[derive(Clone, Debug)]
 pub struct WatchDescriptor{
     id: c_int,
-    fd: Weak<RawFd>,
+    fd: Weak<CoIo<InotifyFd>>,
 }
 
 impl Eq for WatchDescriptor {}
 
 impl PartialEq for WatchDescriptor {
     fn eq(&self, other: &Self) -> bool {
-        let self_fd  = self.fd.upgrade();
-        let other_fd = other.fd.upgrade();
+        let self_fd  = self.fd.upgrade().as_ref().map(|coio| coio.as_raw_fd());
+        let other_fd = other.fd.upgrade().as_ref().map(|coio| coio.as_raw_fd());
 
         self.id == other.id && self_fd.is_some() && self_fd == other_fd
     }
@@ -850,14 +874,14 @@ impl Hash for WatchDescriptor {
 /// [`Inotify::read_events_blocking`]: struct.Inotify.html#method.read_events_blocking
 /// [`Inotify::read_events`]: struct.Inotify.html#method.read_events
 pub struct Events<'a> {
-    fd       : Weak<RawFd>,
+    fd       : Weak<CoIo<InotifyFd>>,
     buffer   : &'a [u8],
     num_bytes: usize,
     pos      : usize,
 }
 
 impl<'a> Events<'a> {
-    fn new(fd: Weak<RawFd>, buffer: &'a [u8], num_bytes: usize) -> Self {
+    fn new(fd: Weak<CoIo<InotifyFd>>, buffer: &'a [u8], num_bytes: usize) -> Self {
         Events {
             fd       : fd,
             buffer   : buffer,
@@ -963,7 +987,7 @@ impl<'a> Iterator for Events<'a> {
 ///
 /// Here's how to determine if this event indicates that a file was modified:
 ///
-/// ``` rust
+/// ``` rust,no_run
 /// # use std::mem;
 /// # use std::os::unix::io::RawFd;
 /// # use std::rc::Weak;
@@ -975,7 +999,7 @@ impl<'a> Iterator for Events<'a> {
 /// #
 /// # // Construct a fake event for the sake of this example
 /// # let event: Event = Event {
-/// #     wd    : unsafe { mem::transmute((0, Weak::<RawFd>::new())) },
+/// #     wd    : unsafe { mem::uninitialized() },
 /// #     mask  : EventMask::MODIFY,
 /// #     cookie: 0,
 /// #     name  : None,
@@ -1026,7 +1050,7 @@ pub struct Event<'a> {
 }
 
 impl<'a> Event<'a> {
-    fn new(fd: Weak<RawFd>, event: &ffi::inotify_event, name: &'a OsStr)
+    fn new(fd: Weak<CoIo<InotifyFd>>, event: &ffi::inotify_event, name: &'a OsStr)
         -> Self
     {
         let mask = EventMask::from_bits(event.mask)
